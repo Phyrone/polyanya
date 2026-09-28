@@ -453,21 +453,13 @@ impl Mesh {
 
         let from = from.into();
         let to = to.into();
-
-        let starting_polygon_index = if from.polygon_index != u32::MAX {
-            from.polygon_index
-        } else {
-            self.get_closest_point_on_layers(from, blocked_layers.clone())
-                .ok_or(SearchFailure::OffMesh)?
-                .polygon_index
-        };
-        let ending_polygon = if to.polygon_index != u32::MAX {
-            to.polygon_index
-        } else {
-            self.get_closest_point_on_layers(to, blocked_layers.clone())
-                .ok_or(SearchFailure::OffMesh)?
-                .polygon_index
-        };
+        let starting_polygon_index = self.search_polygon(from, &blocked_layers)?;
+        let ending_polygon = self.search_polygon(to, &blocked_layers)?;
+        // The search is rooted at the start, so the start has to lie in its
+        // polygon. The goal is only looked for, and may lie just off it: the
+        // path still ends there.
+        let from = self.onto_polygon(from.pos, starting_polygon_index);
+        let to = to.pos;
         // TODO: fix islands detection with multiple layers, even if start and end are on the same layer
         if self.layers.len() == 1 {
             if let Some(islands) = self.layers[starting_polygon_index.layer() as usize]
@@ -494,23 +486,23 @@ impl Mesh {
                     "{};{};0;0;0;0;0;{}",
                     self.scenarios.get(),
                     start.elapsed().as_secs_f32() * 1_000_000.0,
-                    from.pos.distance(to.pos),
+                    from.distance(to),
                 );
                 self.scenarios.set(self.scenarios.get() + 1);
             }
             return Ok(Path {
-                length: from.pos.distance(to.pos),
-                path: vec![to.pos],
+                length: from.distance(to),
+                path: vec![to],
                 #[cfg(feature = "detailed-layers")]
-                path_with_layers: vec![(to.pos, ending_polygon.layer())],
+                path_with_layers: vec![(to, ending_polygon.layer())],
                 path_through_polygons: vec![ending_polygon],
             });
         }
 
         let mut search_instance = SearchInstance::setup(
             self,
-            (from.pos, starting_polygon_index),
-            (to.pos, ending_polygon),
+            (from, starting_polygon_index),
+            (to, ending_polygon),
             blocked_layers,
             #[cfg(feature = "stats")]
             start,
@@ -547,6 +539,59 @@ impl Mesh {
         } else {
             Err(SearchFailure::BudgetExhausted { iterations: budget })
         }
+    }
+
+    /// The polygon a search starts or ends in: the one `point` names, or else
+    /// the closest one.
+    fn search_polygon(
+        &self,
+        point: Coords,
+        blocked_layers: &HashSet<u8>,
+    ) -> Result<u32, SearchFailure> {
+        if point.polygon_index != u32::MAX {
+            return Ok(point.polygon_index);
+        }
+        self.get_closest_point_on_layers(point, blocked_layers.clone())
+            .map(|closest| closest.polygon_index)
+            .ok_or(SearchFailure::OffMesh)
+    }
+
+    /// `point` if the polygon holds it, else the polygon's point nearest to
+    /// it, just inside its edge.
+    ///
+    /// A point is found on a polygon up to `search_delta` away from it (see
+    /// [`Self::get_point_layer`]), so a [`Coords`] may name a polygon its
+    /// position lies just outside of — across an edge, often, where two
+    /// overlapping layers are stitched. A search rooted there looks at that
+    /// polygon's edges from the wrong side, and finds no way out of it.
+    fn onto_polygon(&self, point: Vec2, polygon_index: u32) -> Vec2 {
+        /// How far inside its polygon a moved point is put, so it is not on
+        /// the edge it was moved across.
+        const INSET: f32 = 1e-3;
+
+        let layer = &self.layers[polygon_index.layer() as usize];
+        let polygon = &layer.polygons[polygon_index.polygon() as usize];
+        let local = point - layer.offset;
+        if polygon.contains(layer, local) {
+            return point;
+        }
+        let corners = polygon.coords(layer);
+        let centre = corners.iter().sum::<Vec2>() / corners.len() as f32;
+        let nearest = corners
+            .iter()
+            .zip(corners.iter().cycle().skip(1))
+            .map(|(a, b)| {
+                let along = *b - *a;
+                let t = ((local - *a).dot(along) / along.length_squared().max(f32::EPSILON))
+                    .clamp(0.0, 1.0);
+                *a + along * t
+            })
+            .min_by(|p, q| {
+                p.distance_squared(local)
+                    .total_cmp(&q.distance_squared(local))
+            })
+            .unwrap_or(centre);
+        nearest + (centre - nearest).clamp_length_max(INSET) + layer.offset
     }
 
     /// How long a path search may run before it gives up, in iterations per

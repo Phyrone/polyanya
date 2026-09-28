@@ -58,6 +58,8 @@ impl Future for FuturePath<'_> {
             if ending_polygon == u32::MAX {
                 return Poll::Ready(None);
             }
+            let from = self.mesh.onto_polygon(self.from, starting_polygon_index);
+            let to = self.to;
             if starting_polygon_index.layer() == ending_polygon.layer() {
                 if let Some(islands) = self.mesh.layers[starting_polygon_index.layer() as usize]
                     .islands
@@ -84,24 +86,24 @@ impl Future for FuturePath<'_> {
                         "{};{};0;0;0;0;0;{}",
                         self.mesh.scenarios.get(),
                         start.elapsed().as_secs_f32() * 1_000_000.0,
-                        self.from.distance(self.to),
+                        from.distance(to),
                     );
                     self.mesh.scenarios.set(self.mesh.scenarios.get() + 1);
                 }
                 return Poll::Ready(Some(Path {
-                    length: self.from.distance(self.to),
-                    path: vec![self.to],
+                    length: from.distance(to),
+                    path: vec![to],
                     #[cfg(feature = "detailed-layers")]
                     #[cfg_attr(docsrs, doc(cfg(feature = "detailed-layers")))]
-                    path_with_layers: vec![(self.to, ending_polygon.layer())],
+                    path_with_layers: vec![(to, ending_polygon.layer())],
                     path_through_polygons: vec![ending_polygon],
                 }));
             }
 
             self.instance = Some(SearchInstance::setup(
                 self.mesh,
-                (self.from, starting_polygon_index),
-                (self.to, ending_polygon),
+                (from, starting_polygon_index),
+                (to, ending_polygon),
                 HashSet::default(),
                 #[cfg(feature = "stats")]
                 start,
