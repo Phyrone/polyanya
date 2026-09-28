@@ -88,3 +88,37 @@ fn saying_no_path_does_not_cost_the_whole_mesh() {
          entered: {small:?} with one extra layer against {large:?} with eight"
     );
 }
+
+/// A search says why it found no path: one that searched everything the start
+/// can reach says the goal is unreachable, one cut short by its budget says
+/// so instead — and only that one may have had a path to find.
+#[test]
+fn a_search_says_why_it_found_no_path() {
+    use std::collections::HashSet;
+
+    use polyanya::SearchFailure;
+
+    let mut mesh = mesh_with_an_unreachable_island(1);
+    assert_eq!(
+        mesh.search_path(
+            Vec2::new(1005.0, 1005.0),
+            Vec2::new(233.0, 501.0),
+            HashSet::default()
+        )
+        .err(),
+        Some(SearchFailure::Unreachable)
+    );
+
+    // One of aurora's longest scenarios: a path of about 1200 across the map.
+    let (from, to) = (Vec2::new(993.5, 290.5), Vec2::new(34.5, 622.5));
+    assert!(
+        mesh.search_path(from, to, HashSet::default()).is_ok(),
+        "the default budget finds it"
+    );
+    mesh.set_search_budget(0);
+    assert!(matches!(
+        mesh.search_path(from, to, HashSet::default()),
+        Err(SearchFailure::BudgetExhausted { .. })
+    ));
+    assert_eq!(mesh.path(from, to), None, "and `path` still says none");
+}

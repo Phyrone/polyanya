@@ -183,8 +183,36 @@ pub struct Mesh {
     pub search_delta: f32,
     /// Number of steps before stopping searching for a point in a mesh
     pub search_steps: u32,
+    /// How long a path search may run before it gives up, in iterations per
+    /// polygon of the mesh. See [`Mesh::set_search_budget`].
+    #[cfg_attr(feature = "serde", serde(default = "default_search_budget"))]
+    pub search_budget: u32,
     #[cfg(feature = "stats")]
     pub(crate) scenarios: Cell<u32>,
+}
+
+/// The search budget a mesh starts with: ten iterations per polygon.
+fn default_search_budget() -> u32 {
+    10
+}
+
+/// Why [`Mesh::search_path`] found no path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum SearchFailure {
+    /// An end is off the mesh, further than the point search reaches.
+    #[error("an end of the path is not on the mesh")]
+    OffMesh,
+    /// Everything reachable from the start was searched, and the goal is not.
+    #[error("there is no path between the two points")]
+    Unreachable,
+    /// The search was still going when its budget ran out: there may well
+    /// be a path, longer or more winding than the budget allows for. See
+    /// [`Mesh::set_search_budget`].
+    #[error("the search gave up after {iterations} iterations")]
+    BudgetExhausted {
+        /// How many iterations it ran.
+        iterations: usize,
+    },
 }
 
 /// A point in the navigation mesh
@@ -297,6 +325,7 @@ impl Default for Mesh {
             layers: vec![],
             search_delta: 0.1,
             search_steps: 2,
+            search_budget: default_search_budget(),
             #[cfg(feature = "stats")]
             scenarios: Cell::new(0),
         }
@@ -404,6 +433,21 @@ impl Mesh {
         to: impl Into<Coords>,
         blocked_layers: HashSet<u8>,
     ) -> Option<Path> {
+        self.search_path(from, to, blocked_layers).ok()
+    }
+
+    /// Compute a path between two points, and say why there is none.
+    ///
+    /// [`Self::path_on_layers`] answers `None` both when there is no path and
+    /// when the search ran out of its budget before finding one; this tells
+    /// them apart. See [`SearchFailure`].
+    #[cfg_attr(feature = "tracing", instrument(skip_all))]
+    pub fn search_path(
+        &self,
+        from: impl Into<Coords>,
+        to: impl Into<Coords>,
+        blocked_layers: HashSet<u8>,
+    ) -> Result<Path, SearchFailure> {
         #[cfg(feature = "stats")]
         let start = Instant::now();
 
@@ -413,13 +457,15 @@ impl Mesh {
         let starting_polygon_index = if from.polygon_index != u32::MAX {
             from.polygon_index
         } else {
-            self.get_closest_point_on_layers(from, blocked_layers.clone())?
+            self.get_closest_point_on_layers(from, blocked_layers.clone())
+                .ok_or(SearchFailure::OffMesh)?
                 .polygon_index
         };
         let ending_polygon = if to.polygon_index != u32::MAX {
             to.polygon_index
         } else {
-            self.get_closest_point_on_layers(to, blocked_layers.clone())?
+            self.get_closest_point_on_layers(to, blocked_layers.clone())
+                .ok_or(SearchFailure::OffMesh)?
                 .polygon_index
         };
         // TODO: fix islands detection with multiple layers, even if start and end are on the same layer
@@ -431,7 +477,7 @@ impl Mesh {
                 let start_island = islands.get(starting_polygon_index.polygon() as usize);
                 let end_island = islands.get(ending_polygon.polygon() as usize);
                 if start_island.is_some() && end_island.is_some() && start_island != end_island {
-                    return None;
+                    return Err(SearchFailure::Unreachable);
                 }
             }
         }
@@ -452,7 +498,7 @@ impl Mesh {
                 );
                 self.scenarios.set(self.scenarios.get() + 1);
             }
-            return Some(Path {
+            return Ok(Path {
                 length: from.pos.distance(to.pos),
                 path: vec![to.pos],
                 #[cfg(feature = "detailed-layers")]
@@ -470,28 +516,57 @@ impl Mesh {
             start,
         );
 
+        #[allow(unused_mut)]
         let mut paths: Vec<Path> = vec![];
         // Limit search to avoid an infinite loop.
-        for _ in 0..self.layers.iter().map(|l| l.polygons.len()).sum::<usize>() * 10 {
+        let budget = self.layers.iter().map(|l| l.polygons.len()).sum::<usize>()
+            * self.search_budget as usize;
+        let mut ran_dry = false;
+        for _ in 0..budget {
             match search_instance.next() {
                 #[cfg(not(feature = "detailed-layers"))]
-                InstanceStep::Found(path) => return Some(path),
+                InstanceStep::Found(path) => return Ok(path),
                 #[cfg(feature = "detailed-layers")]
                 InstanceStep::Found(path) => paths.push(path),
                 // The queue has run dry and nothing can refill it, so every further step
                 // is a pop from an empty heap. Keep going and we just burn the whole
                 // iteration limit before returning the answer we already have.
-                InstanceStep::NotFound => break,
+                InstanceStep::NotFound => {
+                    ran_dry = true;
+                    break;
+                }
                 InstanceStep::Continue => (),
             }
         }
         #[cfg(feature = "detailed-layers")]
         paths.sort_unstable_by(|p1, p2| p1.length.partial_cmp(&p2.length).unwrap());
-        if paths.is_empty() {
-            None
+        if !paths.is_empty() {
+            Ok(paths.remove(0))
+        } else if ran_dry {
+            Err(SearchFailure::Unreachable)
         } else {
-            Some(paths.remove(0))
+            Err(SearchFailure::BudgetExhausted { iterations: budget })
         }
+    }
+
+    /// How long a path search may run before it gives up, in iterations per
+    /// polygon of the mesh.
+    pub fn search_budget(&self) -> u32 {
+        self.search_budget
+    }
+
+    /// Sets how long a path search may run before it gives up, in iterations
+    /// per polygon of the mesh. The default is 10.
+    ///
+    /// The budget is only a guard against a search that never ends: a search
+    /// stops the moment it finds its path, or has searched everything the
+    /// start can reach. A winding route on a mesh with few polygons — the
+    /// way round a ring of walls, say — can need more than the default, and
+    /// then the search gives up with [`SearchFailure::BudgetExhausted`]
+    /// although there is a path.
+    pub fn set_search_budget(&mut self, per_polygon: u32) -> &mut Self {
+        self.search_budget = per_polygon;
+        self
     }
 
     /// The delta set by [`Mesh::set_delta`]
